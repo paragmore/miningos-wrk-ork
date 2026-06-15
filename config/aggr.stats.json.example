@@ -375,6 +375,18 @@
       }
     }
   },
+  "dcs": {
+    "ops": {
+      "alerts_aggr": {
+        "op": "alerts_aggr",
+        "src": "alerts_cnt"
+      },
+      "site_power_w": {
+        "op": "sum",
+        "src": "site_power_w"
+      }
+    }
+  },
   "sensor": {
     "ops": {
       "alerts_aggr": {
