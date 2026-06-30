@@ -397,6 +397,10 @@
   },
   "minerpool": {
     "ops": {
+      "alerts": {
+        "op": "arr_concat",
+        "src": "alerts"
+      },
       "stats": {
         "op": "arr_concat",
         "src": "stats"
