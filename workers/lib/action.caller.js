@@ -132,8 +132,10 @@ class ActionCaller {
    * @param {string} id
    * @param {string} method
    * @param {any[]} params
+   * @param {Object} [opts]
+   * @param {number} [opts.timeout]
    */
-  async _callThing (rack, id, method, params) {
+  async _callThing (rack, id, method, params, opts = {}) {
     const raw = await this._racks.get(rack)
     const entry = JSON.parse(raw.value.toString())
 
@@ -161,7 +163,8 @@ class ActionCaller {
       return this._net.jRequest(
         entry.info.rpcPublicKey,
         method,
-        formattedParams
+        formattedParams,
+        opts
       )
     }
 
@@ -174,7 +177,8 @@ class ActionCaller {
     return this._net.jRequest(
       entry.info.rpcPublicKey,
       'queryThing',
-      { id, method, params: resolvedParams }
+      { id, method, params: resolvedParams },
+      opts
     )
   }
 
@@ -314,8 +318,10 @@ class ActionCaller {
    * @param {string} action
    * @param {any[]} params
    * @param {Object<string, { calls: Array<{id: string, tags: string[]}>, error?: string, isOrkAction?: boolean }>} targets
+   * @param {Object} [opts]
+   * @param {number} [opts.timeout]
    */
-  async callTargets (action, params, targets) {
+  async callTargets (action, params, targets, opts = {}) {
     if (this.orkActions.has(action) && targets.ork?.isOrkAction) {
       if (!this._orkInstance) {
         throw new Error('ERR_ORK_INSTANCE_NOT_SET')
@@ -341,7 +347,7 @@ class ActionCaller {
 
     await async.eachLimit(calls, this._callTargetsLimit, async ([rack, call]) => {
       try {
-        const result = await this._callThing(rack, call.id, action, params)
+        const result = await this._callThing(rack, call.id, action, params, opts)
         call.result = result
       } catch (err) {
         call.error = err.message

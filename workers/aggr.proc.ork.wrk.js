@@ -14,11 +14,16 @@ const {
   RPC_METHODS,
   COMMENT_ACTION,
   INVALID_ACTIONS_ERRORS,
+  INSTANT_ACTIONS,
+  INSTANT_ACTION_CALL_TIMEOUT_MS,
   DEFAULT_TIMEZONE,
   DISALLOWED_QUERY_OPERATORS,
   CONFIG_TYPES,
   DEFAULT_ACTION_CONFIG_RESOLVERS
 } = require('./lib/constants')
+const { ACTION_STATUS } = require('@tetherto/svc-facs-action-approver')
+const { convIntToBin } = require('@tetherto/svc-facs-action-approver/src/utils')
+const { format: sformat } = require('util')
 const aggrCrossthg = require('./lib/aggr.crossthg')
 const { setTimeout: sleep } = require('timers/promises')
 const { createDataProxy } = require('./lib/data.proxy')
@@ -686,6 +691,16 @@ class WrkProcAggr extends TetherWrkBase {
       return { id: null, errors }
     }
 
+    if (INSTANT_ACTIONS.has(action) && reqVotes === 1) {
+      const data = await this._execActionInstant({
+        action,
+        payload: [params, targets, requiredPerms, approvalPerms],
+        voter,
+        batchActionUID
+      })
+      return { id: data.id, data, errors }
+    }
+
     const data = await this.actionApprover_0.pushAction({
       action,
       payload: [params, targets, requiredPerms, approvalPerms],
@@ -696,6 +711,56 @@ class WrkProcAggr extends TetherWrkBase {
       batchActionUID
     })
     return { id: data.id, data, errors }
+  }
+
+  async _execActionInstant ({ action, payload, voter, batchActionUID }) {
+    const approver = this.actionApprover_0
+
+    if (!approver._validVoter(voter)) {
+      throw new Error('ERR_VOTER_INVALID')
+    }
+
+    const data = await approver.queue.pushTask(async () => {
+      const id = Date.now()
+      while (Date.now() <= id) {
+        await sleep(1)
+      }
+      return {
+        id,
+        batchActionUID,
+        action,
+        payload,
+        votesPos: [voter],
+        votesNeg: [],
+        reqVotesPos: 1,
+        reqVotesNeg: 1,
+        status: ACTION_STATUS.EXECUTING
+      }
+    })
+
+    const [params, targets] = data.payload
+    const paramsWithActionId = [
+      ...params,
+      { actionId: data.id, user: voter }
+    ]
+
+    try {
+      const result = await this.actionCaller.callTargets(
+        action,
+        paramsWithActionId,
+        targets,
+        { timeout: INSTANT_ACTION_CALL_TIMEOUT_MS }
+      )
+      data.result = result
+      data.status = ACTION_STATUS.COMPLETED
+    } catch (err) {
+      data.status = ACTION_STATUS.FAILED
+      data.error = sformat(err)
+    } finally {
+      await approver.dbActDone.put(convIntToBin(data.id), approver._encode(data))
+    }
+
+    return data
   }
 
   async getGlobalConfig (req) {

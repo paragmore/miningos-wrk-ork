@@ -320,3 +320,238 @@ test('_filterInvalidActionsErrors - error filtering in targets', async (t) => {
     t.is(filteredActions[0].id, 'action-2', 'should keep action with at least one valid target')
   })
 })
+
+test('instant actions', async (t) => {
+  const WrkProcAggr = require('../../workers/aggr.proc.ork.wrk')
+  const { ACTION_STATUS } = require('@tetherto/svc-facs-action-approver')
+  const { INSTANT_ACTIONS, INSTANT_ACTION_CALL_TIMEOUT_MS } = require('../../workers/lib/constants')
+
+  const createMockDb = () => {
+    const store = new Map()
+    return {
+      store,
+      put: async (key, value) => { store.set(key.toString('hex'), value) },
+      del: async (key) => { store.delete(key.toString('hex')) },
+      get: async (key) => {
+        const value = store.get(key.toString('hex'))
+        return value ? { value } : null
+      }
+    }
+  }
+
+  const createMockApprover = () => ({
+    dbActDone: createMockDb(),
+    queue: { pushTask: async (fn) => await fn() },
+    _encode: (data) => Buffer.from(JSON.stringify(data), 'utf-8'),
+    _validVoter: (voter) => Boolean(voter && typeof voter === 'string' && voter.trim()),
+    pushAction: async () => { throw new Error('ERR_QUEUE_SHOULD_NOT_BE_USED') }
+  })
+
+  const createWrk = (approver, callTargets) => {
+    const wrk = Object.create(WrkProcAggr.prototype)
+    wrk.actionApprover_0 = approver
+    wrk.actionCaller = { callTargets }
+    return wrk
+  }
+
+  t.test('should contain registerThing and updateThing', async (t) => {
+    t.ok(INSTANT_ACTIONS.has('registerThing'), 'registerThing is instant')
+    t.ok(INSTANT_ACTIONS.has('updateThing'), 'updateThing is instant')
+    t.is(INSTANT_ACTIONS.size, 2, 'no other instant actions')
+  })
+
+  t.test('should execute action and record it as COMPLETED in done db', async (t) => {
+    const approver = createMockApprover()
+    const callTargetsCalls = []
+    const wrk = createWrk(approver, async (action, params, targets, opts) => {
+      callTargetsCalls.push({ action, params, targets, opts })
+      targets['rack-1'].calls[0].result = 1
+    })
+
+    const targets = { 'rack-1': { calls: [{ id: 'thing-1', tags: [] }] } }
+    const payload = [[{ rackId: 'rack-1', opts: {} }], targets, ['inventory'], []]
+
+    const data = await wrk._execActionInstant({
+      action: 'registerThing',
+      payload,
+      voter: 'user@example.com',
+      batchActionUID: 'batch-1'
+    })
+
+    t.is(data.status, ACTION_STATUS.COMPLETED, 'status is COMPLETED')
+    t.ok(data.id, 'id assigned')
+    t.alike(data.votesPos, ['user@example.com'], 'voter recorded')
+    t.is(data.reqVotesPos, 1, 'reqVotesPos is 1')
+    t.is(data.batchActionUID, 'batch-1', 'batchActionUID kept')
+
+    t.is(callTargetsCalls.length, 1, 'callTargets called once')
+    const call = callTargetsCalls[0]
+    t.is(call.action, 'registerThing', 'action forwarded')
+    t.alike(
+      call.params[call.params.length - 1],
+      { actionId: data.id, user: 'user@example.com' },
+      'audit tail appended to params'
+    )
+    t.is(call.opts.timeout, INSTANT_ACTION_CALL_TIMEOUT_MS, 'timeout passed')
+
+    t.is(approver.dbActDone.store.size, 1, 'record stored in done db')
+
+    const stored = JSON.parse([...approver.dbActDone.store.values()][0].toString())
+    t.is(stored.status, ACTION_STATUS.COMPLETED, 'stored status is COMPLETED')
+    t.is(stored.action, 'registerThing', 'stored action name')
+    t.is(
+      stored.payload[1]['rack-1'].calls[0].result, 1,
+      'per-call result captured in stored targets'
+    )
+  })
+
+  t.test('should record FAILED action in done db when execution throws', async (t) => {
+    const approver = createMockApprover()
+    const wrk = createWrk(approver, async () => {
+      throw new Error('ERR_DOWNSTREAM_TIMEOUT')
+    })
+
+    const targets = { 'rack-1': { calls: [{ id: 'thing-1', tags: [] }] } }
+    const data = await wrk._execActionInstant({
+      action: 'updateThing',
+      payload: [[{ rackId: 'rack-1', id: 'thing-1' }], targets, ['inventory'], []],
+      voter: 'user@example.com'
+    })
+
+    t.is(data.status, ACTION_STATUS.FAILED, 'status is FAILED')
+    t.ok(data.error.includes('ERR_DOWNSTREAM_TIMEOUT'), 'error captured')
+    t.is(approver.dbActDone.store.size, 1, 'failed record stored in done db')
+  })
+
+  t.test('should reject invalid voter', async (t) => {
+    const approver = createMockApprover()
+    const wrk = createWrk(approver, async () => {})
+
+    await t.exception(
+      wrk._execActionInstant({
+        action: 'registerThing',
+        payload: [[{}], {}, [], []],
+        voter: ''
+      }),
+      /ERR_VOTER_INVALID/,
+      'throws for invalid voter'
+    )
+    t.is(approver.dbActDone.store.size, 0, 'nothing stored')
+  })
+
+  t.test('pushAction should execute instant actions without queueing', async (t) => {
+    const approver = createMockApprover()
+    const wrk = createWrk(approver, async (action, params, targets) => {
+      targets['rack-1'].calls[0].result = 1
+    })
+    wrk.actionCaller.getWriteCalls = async () => ({
+      targets: { 'rack-1': { reqVotes: 1, calls: [{ id: 'thing-1', tags: [] }] } },
+      requiredPerms: ['inventory'],
+      approvalPerms: []
+    })
+    wrk._shouldSkipRackType = async () => false
+
+    const res = await wrk.pushAction({
+      query: { rack: 'rack-1' },
+      action: 'registerThing',
+      params: [{ rackId: 'rack-1', opts: {} }],
+      voter: 'user@example.com',
+      authPerms: ['inventory:rw']
+    })
+
+    t.ok(res.id, 'returns action id')
+    t.is(res.data.status, ACTION_STATUS.COMPLETED, 'returns completed action data')
+    t.alike(res.errors, [], 'no errors')
+    t.is(approver.dbActDone.store.size, 1, 'action recorded in done db')
+  })
+
+  t.test('pushAction should fall back to queue when reqVotes > 1', async (t) => {
+    const approver = createMockApprover()
+    const pushedToQueue = []
+    approver.pushAction = async (opts) => {
+      pushedToQueue.push(opts)
+      return { id: 123, ...opts, status: ACTION_STATUS.VOTING }
+    }
+
+    const wrk = createWrk(approver, async () => {
+      throw new Error('ERR_INSTANT_SHOULD_NOT_RUN')
+    })
+    wrk.actionCaller.getWriteCalls = async () => ({
+      targets: { 'rack-1': { reqVotes: 2, calls: [{ id: 'thing-1', tags: [] }] } },
+      requiredPerms: ['inventory'],
+      approvalPerms: []
+    })
+    wrk._shouldSkipRackType = async () => false
+
+    const res = await wrk.pushAction({
+      query: { rack: 'rack-1' },
+      action: 'registerThing',
+      params: [{ rackId: 'rack-1', opts: {} }],
+      voter: 'user@example.com',
+      authPerms: ['inventory:rw']
+    })
+
+    t.is(pushedToQueue.length, 1, 'action went through the approver queue')
+    t.is(pushedToQueue[0].reqVotesPos, 2, 'reqVotes forwarded to approver')
+    t.is(res.id, 123, 'returns queued action id')
+    t.is(approver.dbActDone.store.size, 0, 'not executed instantly')
+  })
+
+  t.test('pushAction should queue non-instant actions', async (t) => {
+    const approver = createMockApprover()
+    const pushedToQueue = []
+    approver.pushAction = async (opts) => {
+      pushedToQueue.push(opts)
+      return { id: 456, ...opts, status: ACTION_STATUS.APPROVED }
+    }
+
+    const wrk = createWrk(approver, async () => {
+      throw new Error('ERR_INSTANT_SHOULD_NOT_RUN')
+    })
+    wrk.actionCaller.getWriteCalls = async () => ({
+      targets: { 'rack-1': { reqVotes: 1, calls: [{ id: 'thing-1', tags: [] }] } },
+      requiredPerms: ['miner'],
+      approvalPerms: []
+    })
+    wrk._shouldSkipRackType = async () => false
+
+    const res = await wrk.pushAction({
+      query: { id: 'thing-1' },
+      action: 'reboot',
+      params: [{}],
+      voter: 'user@example.com',
+      authPerms: ['miner:rw']
+    })
+
+    t.is(pushedToQueue.length, 1, 'reboot went through the approver queue')
+    t.is(res.id, 456, 'returns queued action id')
+  })
+})
+
+test('instant actions - concurrent id allocation stays unique', async (t) => {
+  const WrkProcAggr = require('../../workers/aggr.proc.ork.wrk')
+  const { TaskQueue } = require('@bitfinex/lib-js-util-task-queue')
+
+  const store = new Map()
+  const approver = {
+    dbActDone: { put: async (key, value) => { store.set(key.toString('hex'), value) } },
+    queue: new TaskQueue(1),
+    _encode: (data) => Buffer.from(JSON.stringify(data), 'utf-8'),
+    _validVoter: (voter) => Boolean(voter && typeof voter === 'string' && voter.trim())
+  }
+  const wrk = Object.create(WrkProcAggr.prototype)
+  wrk.actionApprover_0 = approver
+  wrk.actionCaller = { callTargets: async () => {} }
+
+  const results = await Promise.all(
+    Array.from({ length: 10 }, (_, i) => wrk._execActionInstant({
+      action: 'registerThing',
+      payload: [[{ rackId: `rack-${i}`, opts: {} }], { [`rack-${i}`]: { calls: [{ id: `t-${i}` }] } }, [], []],
+      voter: 'user@example.com'
+    }))
+  )
+
+  const ids = results.map(r => r.id)
+  t.is(new Set(ids).size, 10, 'all ids unique')
+  t.is(store.size, 10, 'no done record overwritten')
+})
