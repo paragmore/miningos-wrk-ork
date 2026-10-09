@@ -6,6 +6,7 @@
     }
   ],
   "nominalSiteHashrate_MHS": 709032000000,
+  "invoiceNominalHashrate_MHS": 750000000000,
   "nominalSiteMinerCapacity": 4232,
   "nominalSiteWeightedAvgEfficiency": 28.36,
   "nominalAvailablePowerMWh": 22.5,
