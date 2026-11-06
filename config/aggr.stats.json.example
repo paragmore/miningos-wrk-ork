@@ -397,14 +397,6 @@
         "op": "arr_concat",
         "src": "site_power_w_avg"
       },
-      "site_power_w_min": {
-        "op": "arr_concat",
-        "src": "site_power_w_min"
-      },
-      "site_power_w_max": {
-        "op": "arr_concat",
-        "src": "site_power_w_max"
-      },
       "site_power_w_count": {
         "op": "sum",
         "src": "site_power_w_count"
